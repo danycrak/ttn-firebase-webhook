@@ -1,32 +1,55 @@
 const express = require('express');
-const admin = require('firebase-admin');
+const fetch = require('node-fetch');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 
-// Inicializar Firebase Admin
-const serviceAccount = {
-  type: "service_account",
-  project_id: process.env.FIREBASE_PROJECT_ID,
-  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-  client_email: process.env.FIREBASE_CLIENT_EMAIL,
-  client_id: process.env.FIREBASE_CLIENT_ID,
-  auth_uri: "https://accounts.google.com/o/oauth2/auth",
-  token_uri: "https://oauth2.googleapis.com/token",
-  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-  client_x509_cert_url: process.env.FIREBASE_CERT_URL
-};
+// Configuración Firebase
+const FB_API_KEY = process.env.FB_API_KEY || "AIzaSyCn0pS5Oa5_-cwb4OVaTHEDSKwQxOv5YpM";
+const FB_EMAIL = process.env.FB_EMAIL || "adrian3@gmail.com";
+const FB_PASSWORD = process.env.FB_PASSWORD || "12345678";
+const FB_DB_ROOT = process.env.FB_DB_ROOT || "https://localizadormascotas-68cd5-default-rtdb.firebaseio.com";
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DB_ROOT
-});
+let idToken = null;
+let tokenExpireTime = 0;
 
-const db = admin.database();
+// Obtener token Firebase
+async function getFirebaseToken() {
+  if (idToken && Date.now() < tokenExpireTime) {
+    return idToken;
+  }
 
-// Función para decodificar payload de 10 bytes
+  try {
+    const response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FB_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: FB_EMAIL,
+          password: FB_PASSWORD,
+          returnSecureToken: true
+        })
+      }
+    );
+
+    const data = await response.json();
+    if (!data.idToken) {
+      throw new Error('No token received');
+    }
+
+    idToken = data.idToken;
+    tokenExpireTime = Date.now() + (55 * 60 * 1000); // 55 minutos
+    console.log("✓ Firebase token obtenido");
+    return idToken;
+  } catch (error) {
+    console.error("ERROR obteniendo token Firebase:", error.message);
+    throw error;
+  }
+}
+
+// Decodificar payload de 10 bytes
 function decodePayload(bytes) {
   if (bytes.length < 10) {
     console.log("Payload muy corto:", bytes.length);
@@ -53,82 +76,93 @@ function decodePayload(bytes) {
 // Webhook de TTN
 app.post('/webhook', async (req, res) => {
   try {
-    console.log("Webhook recibido de TTN");
+    console.log("\n=== Webhook TTN recibido ===");
     
     const payload = req.body;
     
-    // Obtener device_id (collar-a, collar-b, etc)
+    // Obtener device_id
     const deviceId = payload.end_device_ids?.device_id;
     if (!deviceId) {
-      console.log("ERROR: No hay device_id en el payload");
+      console.log("ERROR: No device_id");
       return res.status(400).json({ error: "No device_id" });
     }
 
-    // Obtener bytes del payload
-    const payloadBytes = payload.uplink_message?.frm_payload;
-    if (!payloadBytes) {
-      console.log("ERROR: No hay payload en el mensaje");
+    // Obtener payload bytes en base64
+    const payloadBase64 = payload.uplink_message?.frm_payload;
+    if (!payloadBase64) {
+      console.log("ERROR: No hay payload");
       return res.status(400).json({ error: "No payload" });
     }
 
     // Convertir base64 a bytes
-    const buffer = Buffer.from(payloadBytes, 'base64');
+    const buffer = Buffer.from(payloadBase64, 'base64');
     const bytes = Array.from(buffer);
-
-    console.log(`Device: ${deviceId}, Bytes: ${bytes.join(', ')}`);
+    console.log(`Device: ${deviceId}, Bytes: [${bytes.join(', ')}]`);
 
     // Decodificar
     const decoded = decodePayload(bytes);
     if (!decoded) {
-      console.log("ERROR: No se pudo decodificar el payload");
+      console.log("ERROR: No se pudo decodificar");
       return res.status(400).json({ error: "Decode error" });
     }
 
-    console.log(`Decodificado: lat=${decoded.lat}, lng=${decoded.lon}, batt=${decoded.batt}%`);
+    console.log(`Decodificado: lat=${decoded.lat.toFixed(6)}, lng=${decoded.lon.toFixed(6)}, batt=${decoded.batt}%`);
 
-    // Obtener sessionId activo desde /collares/{deviceId}/current
-    const currentRef = db.ref(`collares/${deviceId}/current`);
-    const snapshot = await currentRef.once('value');
-    const currentData = snapshot.val();
+    // Obtener token
+    const token = await getFirebaseToken();
+
+    // Obtener sessionId activo
+    const currentUrl = `${FB_DB_ROOT}/collares/${deviceId}/current.json?auth=${token}`;
+    const currentResponse = await fetch(currentUrl);
+    const currentData = await currentResponse.json();
 
     if (!currentData || !currentData.sessionId) {
       console.log(`AVISO: No hay sesión activa para ${deviceId}`);
-      return res.status(200).json({ warning: "No active session" });
+      return res.status(200).json({ warning: "No active session", deviceId });
     }
 
     const sessionId = currentData.sessionId;
     console.log(`Sesión activa: ${sessionId}`);
 
-    // Timestamp en milisegundos
+    // Timestamp
     const timestamp = Date.now();
 
     // Escribir punto en Firebase
-    const pointRef = db.ref(`collares/${deviceId}/sessions/${sessionId}/points/${timestamp}`);
-    await pointRef.set({
-      lat: decoded.lat,
-      lng: decoded.lon,
-      batt: decoded.batt,
-      acc: decoded.acc,
-      ts: timestamp
+    const pointUrl = `${FB_DB_ROOT}/collares/${deviceId}/sessions/${sessionId}/points/${timestamp}.json?auth=${token}`;
+    const pointResponse = await fetch(pointUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lat: decoded.lat,
+        lng: decoded.lon,
+        batt: decoded.batt,
+        acc: decoded.acc,
+        ts: timestamp
+      })
     });
 
-    console.log(`✓ Punto guardado en ${deviceId}/sessions/${sessionId}/points/${timestamp}`);
-    res.json({ status: "ok", deviceId, sessionId, timestamp });
+    if (!pointResponse.ok) {
+      throw new Error(`Firebase write failed: ${pointResponse.status}`);
+    }
+
+    console.log(`✓ Punto guardado`);
+    res.json({ status: "ok", deviceId, sessionId });
 
   } catch (error) {
-    console.error("Error en webhook:", error);
+    console.error("ERROR:", error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Servidor escuchando en puerto ${PORT}`);
-  console.log(`Webhook en: http://localhost:${PORT}/webhook`);
+  console.log(`\n🚀 Servidor escuchando en puerto ${PORT}`);
+  console.log(`📍 Webhook: POST http://localhost:${PORT}/webhook`);
+  console.log(`❤️  Health: GET http://localhost:${PORT}/health\n`);
 });
