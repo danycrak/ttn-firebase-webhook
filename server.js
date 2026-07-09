@@ -1,9 +1,10 @@
 const express = require('express');
-const fetch = require('node-fetch');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
+
+// Node 18+ tiene fetch nativo, no necesita node-fetch
 
 // Configuración Firebase
 const FB_API_KEY = process.env.FB_API_KEY || "AIzaSyCn0pS5Oa5_-cwb4OVaTHEDSKwQxOv5YpM";
